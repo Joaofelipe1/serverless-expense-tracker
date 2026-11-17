@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless Expense Tracker - Lambda, HTTP API (API Gateway), DynamoDB,
+  Cognito, S3 e CloudFront. Configurado para ficar dentro do AWS Free Tier.
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: >
+      Origem permitida no CORS. Depois do primeiro deploy, troque pelo
+      dominio do CloudFront (ex.: https://d123abc.cloudfront.net).
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]   # Graviton: mais barato e conta igual no free tier
+    MemorySize: 128
+    Timeout: 10
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ExpensesTable
+
+Resources:
+  # ---------------------------------------------------------------
+  # Autenticacao - Cognito (tier LITE = 10.000 MAU gratis/mes)
+  # ---------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UserPoolTier: LITE
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]   # e-mail padrao do Cognito, sem SES/SNS
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: false
+          RequireSymbols: false
+      MfaConfiguration: "OFF"   # evita custo de SMS
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: web-client
+      GenerateSecret: false   # app de navegador (cliente publico)
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ---------------------------------------------------------------
+  # Banco de dados - DynamoDB (provisionado 5/5 = dentro do free tier)
+  # ---------------------------------------------------------------
+  ExpensesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-expenses
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  # ---------------------------------------------------------------
+  # API - HTTP API com autorizador JWT do Cognito
+  # ---------------------------------------------------------------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20   # protege contra abuso / custo
+        ThrottlingRateLimit: 10
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience:
+                - !Ref UserPoolClient
+
+  ExpensesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/src/
+      Handler: app.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExpensesTable
+      Events:
+        ListExpenses:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /expenses, Method: GET }
+        CreateExpense:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /expenses, Method: POST }
+        UpdateExpense:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/expenses/{id}"
+            Method: PUT
+        DeleteExpense:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/expenses/{id}"
+            Method: DELETE
+        Summary:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /summary, Method: GET }
+
+  ExpensesFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ExpensesFunction}
+      RetentionInDays: 7   # logs curtos = sem custo acumulado
+
+  # ---------------------------------------------------------------
+  # Frontend - S3 privado + CloudFront (OAC)
+  # ---------------------------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Expense Tracker frontend
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_All   # inclui servidores na America do Sul
+        HttpVersion: http2and3
+        Origins:
+          - Id: s3-frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: s3-frontend
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Value: !Ref Distribution
+  WebsiteUrl:
+    Value: !Sub https://${Distribution.DomainName}
