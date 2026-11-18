@@ -2,7 +2,7 @@
 
 Aplicação web totalmente serverless para gestão de despesas pessoais na AWS, com autenticação JWT, infraestrutura como código e pipeline de CI/CD. Opera dentro do AWS Free Tier.
 
-**Demo:** _cole aqui a URL do CloudFront depois do deploy_
+**Demo:** [dymz6j8y1gu84.cloudfront.net](https://dymz6j8y1gu84.cloudfront.net) — crie uma conta com qualquer e-mail para testar.
 
 ## Arquitetura
 
