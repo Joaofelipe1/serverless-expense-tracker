@@ -7,10 +7,10 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # necessario para autenticar na AWS via OIDC (sem chaves fixas)
+  id-token: write   # permite pedir o token OIDC para autenticar na AWS (sem chaves salvas)
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION || 'sa-east-1' }}   # defina a variavel AWS_REGION no repositorio para trocar
+  AWS_REGION: ${{ vars.AWS_REGION || 'sa-east-1' }}
   STACK_NAME: expense-tracker
 
 jobs:
@@ -18,31 +18,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
       - name: Instalar dependencias
         run: pip install -r backend/requirements-dev.txt cfn-lint
+
       - name: Testes unitarios
         run: pytest -q backend/tests
+
       - name: Validar template
         run: cfn-lint template.yaml
 
   deploy:
-    needs: test
+    needs: test   # so roda se os testes passarem
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    concurrency: deploy-producao   # evita dois deploys ao mesmo tempo
     steps:
       - uses: actions/checkout@v4
+
+      # O sam build precisa da mesma versao de Python do runtime da Lambda
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
       - uses: aws-actions/setup-sam@v2
         with:
           use-installer: true
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
       - name: Deploy
-        run: ./scripts/deploy.sh "$STACK_NAME" "$AWS_REGION"
+        run: bash scripts/deploy.sh "$STACK_NAME" "$AWS_REGION"
